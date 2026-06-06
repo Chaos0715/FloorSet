@@ -36,9 +36,40 @@ contest_venv/
 *.swp
 *.swo
 
-# Results and logs (optional - contestants may want to track these)
+# Results and logs
 *_results.json
+*_solutions.json
+*_subset_results.json
+*_summary.json
+*_summary.csv
+*_eval.stdout
+*.stdout
 *.log
+*.out
+*.err
+
+# Local experiment output directories
+flow_ablation_results/
+flow_subset_results/
+ga_budget_manual/
+ga_stability_*_results/
+repair_ablation_results/
+soft_repair_*_cases/
+visualizations/
+
+# Model checkpoints and generated training artifacts
+models/
+checkpoints/
+runs/
+wandb/
+*.ckpt
+*.pt
+
+# Local data copies
+floorset_lite/
+
+# Local notes
+plan.md
 
 # OS
 .DS_Store
