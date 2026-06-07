@@ -1184,14 +1184,29 @@ class MyOptimizer(FloorplanOptimizer):
             boundary = 0.0
             code = boundary_codes[block]
             if code:
+                # Scale boundary penalty to dominate the area/HPWL terms.
+                # exp(2*V_rel) is a multiplier on the contest score, so a single
+                # satisfied bit is worth a meaningful slice of wire/area cost.
+                bw = float(__import__("os").environ.get("FLOORSET_BOUNDARY_WEIGHT", "200.0")) * mean_side
                 if code & 1 and abs(x - min_x) > 1e-5:
-                    boundary += mean_side
+                    boundary += bw
                 if code & 2 and abs(x + w - max_x) > 1e-5:
-                    boundary += mean_side
+                    boundary += bw
                 if code & 4 and abs(y + h - max_y) > 1e-5:
-                    boundary += mean_side
+                    boundary += bw
                 if code & 8 and abs(y - min_y) > 1e-5:
-                    boundary += mean_side
+                    boundary += bw
+                # Prefer aspect ratios aligned with the edge: tall+thin for
+                # left/right (small w), wide+short for top/bottom (small h).
+                # Neutral for corners (both bits set). Magnitude calibrated to
+                # the area term so it tips the choice between satisfying ratios
+                # without overriding wire/satisfaction signals.
+                has_lr = (code & 1) or (code & 2)
+                has_tb = (code & 4) or (code & 8)
+                if has_lr and not has_tb and w > h:
+                    boundary += 0.05 * mean_side * (w - h)
+                if has_tb and not has_lr and h > w:
+                    boundary += 0.05 * mean_side * (h - w)
             touch = 0.0
             for nbr, affinity in prior_touch_adj[block]:
                 if nbr in placed and positions[nbr] is not None:
@@ -1200,7 +1215,34 @@ class MyOptimizer(FloorplanOptimizer):
                         touch -= 0.30 * mean_side * affinity
                     else:
                         touch += 0.08 * affinity * edge_gap_distance(rect, other)
-            return wire + 0.02 * area + 1e9 * overlap + boundary + touch
+
+            # Grouping (cluster) constraint: members of the same cluster must
+            # be edge-connected. Reward this rect if it abuts a placed sibling;
+            # penalize proportional to the smallest gap when no sibling is
+            # touched. Weight is below boundary's so quality isn't sacrificed
+            # for clusters that have no feasible adjacency.
+            cluster_term = 0.0
+            cid = cluster_ids[block]
+            if cid > 0:
+                siblings = [j for j in placed
+                            if positions[j] is not None and cluster_ids[j] == cid]
+                if siblings:
+                    cw = float(__import__("os").environ.get("FLOORSET_CLUSTER_WEIGHT", "120.0"))
+                    connected = False
+                    min_gap = float("inf")
+                    for j in siblings:
+                        if edge_connected(rect, positions[j]):
+                            connected = True
+                            break
+                        gap = edge_gap_distance(rect, positions[j])
+                        if gap < min_gap:
+                            min_gap = gap
+                    if connected:
+                        cluster_term -= 8.0 * mean_side
+                    else:
+                        cluster_term += cw * mean_side + 3.0 * min_gap
+
+            return wire + 0.02 * area + 1e9 * overlap + boundary + touch + cluster_term
 
         def unique_points(points):
             seen = set()
@@ -1260,14 +1302,43 @@ class MyOptimizer(FloorplanOptimizer):
                 max_y = max(positions[j][1] + positions[j][3] for j in placed if positions[j] is not None)
                 points.extend([(max_x, 0.0), (0.0, max_y), (max_x, max_y)])
                 bit_conf = prior_boundary_bits[block]
-                if boundary_codes[block] & 1 or bit_conf[0] >= 0.60:
+                code = boundary_codes[block]
+                if code & 1 or bit_conf[0] >= 0.60:
                     points.extend([(0.0, 0.0), (0.0, max_y)])
-                if boundary_codes[block] & 2 or bit_conf[1] >= 0.60:
+                if code & 2 or bit_conf[1] >= 0.60:
+                    # Extending: block at x=max_x grows bbox by w.
                     points.extend([(max_x, 0.0), (max_x, max_y)])
-                if boundary_codes[block] & 4 or bit_conf[2] >= 0.60:
+                    # Aligning: block at x=max_x-w shares the current right wall
+                    # (only valid if w fits inside current bbox; clamp handles
+                    # negative). Plus aligned stacks above existing right-wall
+                    # blocks so we don't have to extend bbox.
+                    if w < max_x + 1e-9:
+                        points.append((max_x - w, 0.0))
+                        for j in placed:
+                            if positions[j] is None:
+                                continue
+                            jx, jy, jw, jh = positions[j]
+                            if abs(jx + jw - max_x) < 1e-5:
+                                points.append((max_x - w, jy + jh))
+                if code & 4 or bit_conf[2] >= 0.60:
                     points.extend([(0.0, max_y), (max_x, max_y)])
-                if boundary_codes[block] & 8 or bit_conf[3] >= 0.60:
+                    if h < max_y + 1e-9:
+                        points.append((0.0, max_y - h))
+                        for j in placed:
+                            if positions[j] is None:
+                                continue
+                            jx, jy, jw, jh = positions[j]
+                            if abs(jy + jh - max_y) < 1e-5:
+                                points.append((jx + jw, max_y - h))
+                if code & 8 or bit_conf[3] >= 0.60:
                     points.extend([(0.0, 0.0), (max_x, 0.0)])
+                # Corner candidates that respect the current bbox (no expansion).
+                if (code & 2) and (code & 4) and w < max_x + 1e-9 and h < max_y + 1e-9:
+                    points.append((max_x - w, max_y - h))
+                if (code & 1) and (code & 4) and h < max_y + 1e-9:
+                    points.append((0.0, max_y - h))
+                if (code & 2) and (code & 8) and w < max_x + 1e-9:
+                    points.append((max_x - w, 0.0))
 
             if boundary_codes[block] & 1:
                 points.append((0.0, 0.0))
@@ -1277,8 +1348,33 @@ class MyOptimizer(FloorplanOptimizer):
             anchors = unique_points(points)
             if limit is not None and len(anchors) > limit:
                 desired = anchors[1] if len(anchors) > 1 else anchors[0]
-                anchors.sort(key=lambda p: ((p[0] - desired[0]) ** 2 + (p[1] - desired[1]) ** 2, p[1], p[0]))
-                anchors = anchors[:limit]
+                # Boundary blocks need at least the edge-satisfying anchors to
+                # survive the trim. Identify them and keep them up front; fill
+                # the rest by distance to `desired` as before.
+                code = boundary_codes[block]
+                must_keep = []
+                if code and placed:
+                    max_x = max(positions[j][0] + positions[j][2] for j in placed if positions[j] is not None)
+                    max_y = max(positions[j][1] + positions[j][3] for j in placed if positions[j] is not None)
+                    for p in anchors:
+                        px, py = p
+                        ok = True
+                        if code & 1 and abs(px - 0.0) > 1e-5:
+                            ok = False
+                        if code & 2 and abs(px + w - max_x) > 1e-5 and abs(px - max_x) > 1e-5:
+                            ok = False
+                        if code & 4 and abs(py + h - max_y) > 1e-5 and abs(py - max_y) > 1e-5:
+                            ok = False
+                        if code & 8 and abs(py - 0.0) > 1e-5:
+                            ok = False
+                        if ok:
+                            must_keep.append(p)
+                rest = [p for p in anchors if p not in must_keep]
+                rest.sort(key=lambda p: ((p[0] - desired[0]) ** 2 + (p[1] - desired[1]) ** 2, p[1], p[0]))
+                slots = max(limit - len(must_keep), 0)
+                anchors = must_keep + rest[:slots]
+                if not anchors:
+                    anchors = rest[:limit]
             return anchors
 
         def exhaustive_fallback_point(block, w, h, positions, placed):
@@ -2339,6 +2435,327 @@ class MyOptimizer(FloorplanOptimizer):
         if best_positions is not None:
             run_soft_final_repair(best_positions, "soft_final_repair_post")
             run_selective_ga_rescue()
+
+        def boundary_snap_pass(positions, max_iters=4):
+            # Translate unsatisfied boundary blocks onto their required bbox
+            # edge, keeping width/height unchanged. Accept only translations
+            # that produce no overlap. Iterate because the bbox shifts.
+            if positions is None or len(positions) != block_count:
+                return positions
+            if not any(boundary_codes):
+                return positions
+            current = [tuple(p) for p in positions]
+            for _ in range(max_iters):
+                min_x, min_y, max_x, max_y = bbox_bounds(current)
+                bounds = (min_x, min_y, max_x, max_y)
+                moves = []
+                for i, code in enumerate(boundary_codes):
+                    if not code or fixed_xy[i]:
+                        continue
+                    if touches_edge(current[i], bounds, code):
+                        continue
+                    x, y, w, h = current[i]
+                    dx = dy = 0.0
+                    if code & 1:
+                        dx = min_x - x
+                    elif code & 2:
+                        dx = (max_x - w) - x
+                    if code & 8:
+                        dy = min_y - y
+                    elif code & 4:
+                        dy = (max_y - h) - y
+                    moves.append((abs(dx) + abs(dy), i, dx, dy))
+                if not moves:
+                    break
+                moves.sort()
+                changed = False
+                for _dist, i, dx, dy in moves:
+                    if dx == 0.0 and dy == 0.0:
+                        continue
+                    x, y, w, h = current[i]
+                    new_rect = (x + dx, y + dy, w, h)
+                    blocked = False
+                    for j in range(block_count):
+                        if j == i:
+                            continue
+                        if rectangles_overlap(new_rect, current[j]):
+                            blocked = True
+                            break
+                    if blocked:
+                        continue
+                    current[i] = new_rect
+                    changed = True
+                if not changed:
+                    break
+            return current
+
+        def compact_pass(positions):
+            # Slide interior (non-boundary, non-preplaced) blocks left and down
+            # to remove dead space. Boundary-tagged blocks are anchors and never
+            # move here; boundary_snap_pass handles them. Preserves dimensions,
+            # so area / fixed_dim / MIB constraints are unchanged. Acceptance
+            # filtered by full_cost downstream.
+            if positions is None or len(positions) != block_count:
+                return positions
+            result = [tuple(p) for p in positions]
+            free_blocks = [
+                i for i in range(block_count)
+                if not fixed_xy[i] and boundary_codes[i] == 0
+            ]
+            if not free_blocks:
+                return result
+
+            # Floors so we don't drag bbox edges past blocks that anchor them.
+            # If no anchor on a side, use 0 (don't let coords go negative for
+            # free blocks; normalize_if_safe handles small shifts otherwise).
+            anchored_left = [result[i][0] for i in range(block_count) if boundary_codes[i] & 1]
+            anchored_bottom = [result[i][1] for i in range(block_count) if boundary_codes[i] & 8]
+            x_floor = min(anchored_left) if anchored_left else 0.0
+            y_floor = min(anchored_bottom) if anchored_bottom else 0.0
+
+            for _ in range(2):
+                changed = False
+
+                order = sorted(free_blocks, key=lambda i: result[i][0])
+                for i in order:
+                    x, y, w, h = result[i]
+                    new_x = x_floor
+                    for j in range(block_count):
+                        if j == i:
+                            continue
+                        xj, yj, wj, hj = result[j]
+                        y_overlap = min(y + h, yj + hj) - max(y, yj)
+                        if y_overlap > eps and xj + wj <= x + 1e-9:
+                            if xj + wj > new_x:
+                                new_x = xj + wj
+                    if new_x < x - 1e-9:
+                        result[i] = (new_x, y, w, h)
+                        changed = True
+
+                order = sorted(free_blocks, key=lambda i: result[i][1])
+                for i in order:
+                    x, y, w, h = result[i]
+                    new_y = y_floor
+                    for j in range(block_count):
+                        if j == i:
+                            continue
+                        xj, yj, wj, hj = result[j]
+                        x_overlap = min(x + w, xj + wj) - max(x, xj)
+                        if x_overlap > eps and yj + hj <= y + 1e-9:
+                            if yj + hj > new_y:
+                                new_y = yj + hj
+                    if new_y < y - 1e-9:
+                        result[i] = (x, new_y, w, h)
+                        changed = True
+
+                if not changed:
+                    break
+            return result
+
+        def force_directed_refine(positions, iters=12, lr=0.4):
+            # Cheap HPWL-only refinement: slide each free block toward its
+            # connection-weighted centroid; reject moves that overlap. Boundary
+            # blocks are anchored (any horizontal/vertical move could break
+            # their edge constraint). Stops early if a sweep produces no moves.
+            if positions is None or len(positions) != block_count:
+                return positions
+            current = [tuple(p) for p in positions]
+            free_idx = [
+                i for i in range(block_count)
+                if not fixed_xy[i] and boundary_codes[i] == 0
+            ]
+            if not free_idx:
+                return current
+            for _ in range(iters):
+                moved = False
+                for i in free_idx:
+                    x, y, w, h = current[i]
+                    cx = x + w / 2.0
+                    cy = y + h / 2.0
+                    fx = fy = wsum = 0.0
+                    for nbr, weight in b2b_adj[i]:
+                        nx, ny, nw, nh = current[nbr]
+                        fx += weight * (nx + nw / 2.0 - cx)
+                        fy += weight * (ny + nh / 2.0 - cy)
+                        wsum += weight
+                    for pin, weight in p2b_adj[i]:
+                        px = tensor_value(pins_pos, pin, 0)
+                        py = tensor_value(pins_pos, pin, 1)
+                        fx += weight * (px - cx)
+                        fy += weight * (py - cy)
+                        wsum += weight
+                    if wsum <= 0:
+                        continue
+                    dx = lr * fx / wsum
+                    dy = lr * fy / wsum
+                    new_rect = (x + dx, y + dy, w, h)
+                    blocked = False
+                    for j in range(block_count):
+                        if j == i:
+                            continue
+                        if rectangles_overlap(new_rect, current[j]):
+                            blocked = True
+                            break
+                    if not blocked:
+                        current[i] = new_rect
+                        moved = True
+                if not moved:
+                    break
+            return current
+
+        def boundary_swap_repair(positions, max_iters=3):
+            # For each unsatisfied right/top edge boundary block, try to:
+            #   (1) translate to the matching edge if the slot is free
+            #   (2) swap with a non-boundary block that's currently at the
+            #       required edge but doesn't need to be there
+            # Accept only feasible repairs; gated by full_cost downstream.
+            if positions is None or len(positions) != block_count:
+                return positions
+            current = [tuple(p) for p in positions]
+
+            def overlaps_any(rect, exclude):
+                for j in range(block_count):
+                    if j in exclude:
+                        continue
+                    if rectangles_overlap(rect, current[j]):
+                        return True
+                return False
+
+            for _ in range(max_iters):
+                min_x, min_y, max_x, max_y = bbox_bounds(current)
+                bounds = (min_x, min_y, max_x, max_y)
+                changed = False
+                # Try right-edge and top-edge first (they're the ones blocked
+                # by interior blocks; left/bottom satisfied by translation).
+                for i, code in enumerate(boundary_codes):
+                    if not code or fixed_xy[i]:
+                        continue
+                    if touches_edge(current[i], bounds, code):
+                        continue
+                    x, y, w, h = current[i]
+                    tx = x
+                    ty = y
+                    if code & 1:
+                        tx = min_x
+                    elif code & 2:
+                        tx = max_x - w
+                    if code & 8:
+                        ty = min_y
+                    elif code & 4:
+                        ty = max_y - h
+                    target = (tx, ty, w, h)
+
+                    if not overlaps_any(target, {i}):
+                        current[i] = target
+                        changed = True
+                        continue
+
+                    # Swap attempt: find a non-boundary block at the required
+                    # edge but with a y/x slot we can use.
+                    for j in range(block_count):
+                        if j == i or boundary_codes[j] or fixed_xy[j]:
+                            continue
+                        jx, jy, jw, jh = current[j]
+                        at_required_edge = False
+                        if (code & 2) and abs(jx + jw - max_x) < 1e-4:
+                            at_required_edge = True
+                        if (code & 4) and abs(jy + jh - max_y) < 1e-4:
+                            at_required_edge = True
+                        if (code & 1) and abs(jx - min_x) < 1e-4:
+                            at_required_edge = True
+                        if (code & 8) and abs(jy - min_y) < 1e-4:
+                            at_required_edge = True
+                        if not at_required_edge:
+                            continue
+
+                        # Place i at j's edge slot, j at i's old slot.
+                        if code & 2:
+                            new_i = (max_x - w, jy, w, h)
+                        elif code & 1:
+                            new_i = (min_x, jy, w, h)
+                        elif code & 4:
+                            new_i = (jx, max_y - h, w, h)
+                        else:
+                            new_i = (jx, min_y, w, h)
+                        new_j = (x, y, jw, jh)
+                        # Both new rects must be overlap-free w.r.t. everyone
+                        # else AND w.r.t. each other.
+                        if rectangles_overlap(new_i, new_j):
+                            continue
+                        ok = True
+                        for k in range(block_count):
+                            if k == i or k == j:
+                                continue
+                            if rectangles_overlap(new_i, current[k]) or rectangles_overlap(new_j, current[k]):
+                                ok = False
+                                break
+                        if not ok:
+                            continue
+                        # Confirm j still satisfies all its hard constraints
+                        # (dim immutability preserved; area preserved since
+                        # only position changes; preplaced excluded above).
+                        current[i] = new_i
+                        current[j] = new_j
+                        changed = True
+                        break
+
+                if not changed:
+                    break
+            return current
+
+        if best_positions is not None:
+            compacted = compact_pass(best_positions)
+            if hard_feasible(compacted):
+                compacted_cost = full_cost(compacted)
+                if compacted_cost + 1e-9 < best_cost:
+                    best_positions = compacted
+                    best_cost = compacted_cost
+                    flow_scores["compact"] = compacted_cost
+
+            snapped = boundary_snap_pass(best_positions)
+            if hard_feasible(snapped):
+                snapped_cost = full_cost(snapped)
+                if snapped_cost + 1e-9 < best_cost:
+                    best_positions = snapped
+                    best_cost = snapped_cost
+                    flow_scores["boundary_snap"] = snapped_cost
+
+            swapped = boundary_swap_repair(best_positions)
+            if hard_feasible(swapped):
+                swapped_cost = full_cost(swapped)
+                if swapped_cost + 1e-9 < best_cost:
+                    best_positions = swapped
+                    best_cost = swapped_cost
+                    flow_scores["boundary_swap"] = swapped_cost
+
+            # Re-compact after snap/swap — boundary blocks may have created
+            # new dead space inside the tighter bbox.
+            recompacted = compact_pass(best_positions)
+            if hard_feasible(recompacted):
+                rc_cost = full_cost(recompacted)
+                if rc_cost + 1e-9 < best_cost:
+                    best_positions = recompacted
+                    best_cost = rc_cost
+                    flow_scores["compact_after_snap"] = rc_cost
+
+            # HPWL refinement: pull free blocks toward their connection
+            # centroids without changing the bbox set by boundary anchors.
+            forced = force_directed_refine(best_positions)
+            if hard_feasible(forced):
+                forced_cost = full_cost(forced)
+                if forced_cost + 1e-9 < best_cost:
+                    best_positions = forced
+                    best_cost = forced_cost
+                    flow_scores["force_directed"] = forced_cost
+
+            # Final compact in case force-directed left small gaps.
+            final_compact = compact_pass(best_positions)
+            if hard_feasible(final_compact):
+                fc_cost = full_cost(final_compact)
+                if fc_cost + 1e-9 < best_cost:
+                    best_positions = final_compact
+                    best_cost = fc_cost
+                    flow_scores["compact_final"] = fc_cost
 
         result = normalize_if_safe(best_positions)
         if not hard_feasible(result):
