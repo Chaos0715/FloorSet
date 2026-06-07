@@ -74,3 +74,8 @@ plan.md
 # OS
 .DS_Store
 Thumbs.db
+
+
+!models/
+!models/floorset_soft_prior_eval_base.pt
+!models/floorset_prior_seed.pt
