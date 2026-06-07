@@ -58,7 +58,7 @@ soft_repair_*_cases/
 visualizations/
 
 # Model checkpoints and generated training artifacts
-models/
+models/*
 checkpoints/
 runs/
 wandb/
@@ -75,7 +75,9 @@ plan.md
 .DS_Store
 Thumbs.db
 
-
+# Allow only checkpoints used by my_optimizer.py
 !models/
 !models/floorset_soft_prior_eval_base.pt
+!models/floorset_soft_prior_h384_mp6.pt
+!models/floorset_prior.pt
 !models/floorset_prior_seed.pt
