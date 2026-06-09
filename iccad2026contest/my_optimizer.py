@@ -1187,7 +1187,7 @@ class MyOptimizer(FloorplanOptimizer):
                 # Scale boundary penalty to dominate the area/HPWL terms.
                 # exp(2*V_rel) is a multiplier on the contest score, so a single
                 # satisfied bit is worth a meaningful slice of wire/area cost.
-                bw = float(__import__("os").environ.get("FLOORSET_BOUNDARY_WEIGHT", "200.0")) * mean_side
+                bw = float(__import__("os").environ.get("FLOORSET_BOUNDARY_WEIGHT", "150.0")) * mean_side
                 if code & 1 and abs(x - min_x) > 1e-5:
                     boundary += bw
                 if code & 2 and abs(x + w - max_x) > 1e-5:
