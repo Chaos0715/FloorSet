@@ -377,6 +377,9 @@ class MyOptimizer(FloorplanOptimizer):
             "soft_prior_order",
             "soft_prior_cluster",
             "soft_final_repair",
+            "fd_init",
+            "fd_cluster",
+            "frame_rows",
         }
         enabled_flows = None
         if flow_filter_raw:
@@ -384,7 +387,7 @@ class MyOptimizer(FloorplanOptimizer):
 
         def flow_enabled(name: str) -> bool:
             canonical = name
-            for prefix in ("soft_final_repair", "cluster_ga"):
+            for prefix in ("soft_final_repair", "cluster_ga", "frame_rows"):
                 if name.startswith(prefix):
                     canonical = prefix
                     break
@@ -1227,7 +1230,7 @@ class MyOptimizer(FloorplanOptimizer):
                 siblings = [j for j in placed
                             if positions[j] is not None and cluster_ids[j] == cid]
                 if siblings:
-                    cw = float(__import__("os").environ.get("FLOORSET_CLUSTER_WEIGHT", "120.0"))
+                    cw = float(__import__("os").environ.get("FLOORSET_CLUSTER_WEIGHT", "30.0"))
                     connected = False
                     min_gap = float("inf")
                     for j in siblings:
@@ -1283,6 +1286,22 @@ class MyOptimizer(FloorplanOptimizer):
                 x, y, nw, nh = positions[nbr]
                 points.extend([(x + nw, y), (x, y + nh), (x - w, y), (x, y - h)])
 
+            block_cid = cluster_ids[block]
+            cluster_siblings_placed = set()
+            if block_cid > 0:
+                for j in placed:
+                    if positions[j] is not None and cluster_ids[j] == block_cid:
+                        cluster_siblings_placed.add(j)
+                        jx, jy, jw, jh = positions[j]
+                        # All four edge-adjacent positions for sibling abutment
+                        points.extend([
+                            (jx + jw, jy),
+                            (jx - w, jy),
+                            (jx, jy + jh),
+                            (jx, jy - h),
+                        ])
+            # Keep b2b/touch as the HPWL prioritization; cluster siblings only
+            # contribute via their explicit candidates above + must_keep.
             connected_set = {nbr for nbr, _ in b2b_adj[block]} | {nbr for nbr, _ in prior_touch_adj[block]}
             useful_placed = placed
             if limit is not None and len(useful_placed) > limit:
@@ -1349,8 +1368,9 @@ class MyOptimizer(FloorplanOptimizer):
             if limit is not None and len(anchors) > limit:
                 desired = anchors[1] if len(anchors) > 1 else anchors[0]
                 # Boundary blocks need at least the edge-satisfying anchors to
-                # survive the trim. Identify them and keep them up front; fill
-                # the rest by distance to `desired` as before.
+                # survive the trim. Cluster blocks need at least one anchor
+                # edge-adjacent to a placed sibling. Identify both kinds and
+                # keep them up front; fill the rest by distance to `desired`.
                 code = boundary_codes[block]
                 must_keep = []
                 if code and placed:
@@ -1369,6 +1389,16 @@ class MyOptimizer(FloorplanOptimizer):
                             ok = False
                         if ok:
                             must_keep.append(p)
+                if cluster_siblings_placed:
+                    for p in anchors:
+                        if p in must_keep:
+                            continue
+                        px, py = p
+                        rect_p = (px, py, w, h)
+                        for j in cluster_siblings_placed:
+                            if edge_connected(rect_p, positions[j]):
+                                must_keep.append(p)
+                                break
                 rest = [p for p in anchors if p not in must_keep]
                 rest.sort(key=lambda p: ((p[0] - desired[0]) ** 2 + (p[1] - desired[1]) ** 2, p[1], p[0]))
                 slots = max(limit - len(must_keep), 0)
@@ -1504,6 +1534,99 @@ class MyOptimizer(FloorplanOptimizer):
                     draft[i] = (0.0, 0.0, w, h)
             return draft
 
+        def force_directed_draft(initial_draft, iters=None, attract_lr=0.45, repel_lr=0.55):
+            # Refine draft positions toward HPWL optimum with pairwise
+            # repulsion. Attractive force: weighted centroid of b2b + p2b
+            # connections. Repulsive force: push overlapping pairs apart along
+            # smaller-overlap axis. Output may still overlap — legalize
+            # cleans it up, but uses these positions as candidate seeds for
+            # individual block placement.
+            if iters is None:
+                iters = 18 if block_count > 80 else 28
+            pos = [list(p) if p is not None else [0.0, 0.0, mean_side, mean_side]
+                   for p in initial_draft]
+            for _ in range(iters):
+                for i in range(block_count):
+                    if fixed_xy[i]:
+                        continue
+                    if boundary_codes[i]:
+                        # Don't drag boundary blocks off their edges with
+                        # connection forces; the boundary pipeline owns them.
+                        continue
+                    x, y, w, h = pos[i]
+                    cx = x + w / 2.0
+                    cy = y + h / 2.0
+                    fx = 0.0
+                    fy = 0.0
+                    wsum = 0.0
+                    for nbr, weight in b2b_adj[i]:
+                        nx, ny, nw, nh = pos[nbr]
+                        fx += weight * (nx + nw / 2.0)
+                        fy += weight * (ny + nh / 2.0)
+                        wsum += weight
+                    for pin, weight in p2b_adj[i]:
+                        px = tensor_value(pins_pos, pin, 0)
+                        py = tensor_value(pins_pos, pin, 1)
+                        fx += weight * px
+                        fy += weight * py
+                        wsum += weight
+                    if wsum > 0:
+                        target_cx = fx / wsum
+                        target_cy = fy / wsum
+                        new_cx = cx + attract_lr * (target_cx - cx)
+                        new_cy = cy + attract_lr * (target_cy - cy)
+                        pos[i][0] = new_cx - w / 2.0
+                        pos[i][1] = new_cy - h / 2.0
+
+                for i in range(block_count):
+                    if fixed_xy[i]:
+                        continue
+                    xi, yi, wi, hi = pos[i]
+                    for j in range(i + 1, block_count):
+                        if fixed_xy[j]:
+                            continue
+                        xj, yj, wj, hj = pos[j]
+                        ox = min(xi + wi, xj + wj) - max(xi, xj)
+                        oy = min(yi + hi, yj + hj) - max(yi, yj)
+                        if ox <= 0 or oy <= 0:
+                            continue
+                        cxi = xi + wi / 2.0
+                        cxj = xj + wj / 2.0
+                        cyi = yi + hi / 2.0
+                        cyj = yj + hj / 2.0
+                        i_locked = boundary_codes[i] != 0
+                        j_locked = boundary_codes[j] != 0
+                        if ox < oy:
+                            push = repel_lr * (ox + 0.01)
+                            half = push / (1 if (i_locked or j_locked) else 2)
+                            if cxi < cxj:
+                                if not i_locked:
+                                    pos[i][0] -= half
+                                if not j_locked:
+                                    pos[j][0] += half
+                            else:
+                                if not i_locked:
+                                    pos[i][0] += half
+                                if not j_locked:
+                                    pos[j][0] -= half
+                            xi, yi, wi, hi = pos[i]
+                        else:
+                            push = repel_lr * (oy + 0.01)
+                            half = push / (1 if (i_locked or j_locked) else 2)
+                            if cyi < cyj:
+                                if not i_locked:
+                                    pos[i][1] -= half
+                                if not j_locked:
+                                    pos[j][1] += half
+                            else:
+                                if not i_locked:
+                                    pos[i][1] += half
+                                if not j_locked:
+                                    pos[j][1] -= half
+                            xi, yi, wi, hi = pos[i]
+
+            return [tuple(p) for p in pos]
+
         def build_clusters():
             if block_count == 0:
                 return []
@@ -1592,6 +1715,919 @@ class MyOptimizer(FloorplanOptimizer):
 
         prior_ratio_map = enforce_mib_ratio_map({i: idx for i, idx in enumerate(prior_ratio_index) if idx is not None})
 
+        # ------------------------------------------------------------------
+        # Constructive frame tiling ("frame_rows"): build a rectangular die
+        # from horizontal rows of exact-area cells.  Boundary-coded blocks
+        # are pinned to the perimeter (bottom/top rows, row starts/ends),
+        # clusters stay contiguous runs, MIB groups share dimensions, and
+        # whitespace stays near zero because soft cell widths absorb their
+        # row's height exactly.  Preplaced blocks cut rows into intervals.
+        # ------------------------------------------------------------------
+
+        def frame_anchor_frame():
+            # Die frame: edges anchored by preplaced blocks carrying boundary
+            # codes (the bbox edge must pass through their rect edge), area
+            # from the content budget, aspect hinted by the pin span.
+            left_anchor = right_anchor = bottom_anchor = top_anchor = None
+            for i, rect in preplaced_positions.items():
+                code = boundary_codes[i]
+                x, y, w, h = rect
+                if code & 1:
+                    left_anchor = x if left_anchor is None else min(left_anchor, x)
+                if code & 2:
+                    right_anchor = (x + w) if right_anchor is None else max(right_anchor, x + w)
+                if code & 8:
+                    bottom_anchor = y if bottom_anchor is None else min(bottom_anchor, y)
+                if code & 4:
+                    top_anchor = (y + h) if top_anchor is None else max(top_anchor, y + h)
+
+            pre_rects = list(preplaced_positions.values())
+
+            x_lo = 0.0 if left_anchor is None else left_anchor
+            y_lo = 0.0 if bottom_anchor is None else bottom_anchor
+            x_hi_min = None
+            y_hi_min = None
+            for rx, ry, rw, rh in pre_rects:
+                x_lo = min(x_lo, rx)
+                y_lo = min(y_lo, ry)
+                x_hi_min = rx + rw if x_hi_min is None else max(x_hi_min, rx + rw)
+                y_hi_min = ry + rh if y_hi_min is None else max(y_hi_min, ry + rh)
+
+            place_area = sum(areas[i] for i in range(block_count) if not fixed_xy[i])
+            pre_area = sum(r[2] * r[3] for r in pre_rects)
+            budget = (place_area + pre_area) * 1.015
+
+            aspect = 1.0
+            pin_xs = []
+            pin_ys = []
+            for pin, _block, _w in valid_p2b:
+                pin_xs.append(tensor_value(pins_pos, pin, 0))
+                pin_ys.append(tensor_value(pins_pos, pin, 1))
+            if pin_xs:
+                span_x = max(pin_xs) - min(pin_xs)
+                span_y = max(pin_ys) - min(pin_ys)
+                if span_x > eps and span_y > eps:
+                    aspect = max(0.25, min(4.0, span_x / span_y))
+
+            x_hi = x_hi_min
+            y_hi = y_hi_min
+            if right_anchor is not None:
+                x_hi = right_anchor if x_hi is None else max(x_hi, right_anchor)
+            if top_anchor is not None:
+                y_hi = top_anchor if y_hi is None else max(y_hi, top_anchor)
+
+            if right_anchor is not None and top_anchor is None:
+                cand = y_lo + budget / max(x_hi - x_lo, eps)
+                y_hi = cand if y_hi is None else max(y_hi, cand)
+            elif top_anchor is not None and right_anchor is None:
+                cand = x_lo + budget / max(y_hi - y_lo, eps)
+                x_hi = cand if x_hi is None else max(x_hi, cand)
+            elif right_anchor is None and top_anchor is None:
+                cand_x = x_lo + math.sqrt(max(budget, eps) * aspect)
+                x_hi = cand_x if x_hi is None else max(x_hi, cand_x)
+                cand_y = y_lo + budget / max(x_hi - x_lo, eps)
+                y_hi = cand_y if y_hi is None else max(y_hi, cand_y)
+
+            # Content must fit; if anchors leave too little room grow the
+            # edge that breaks fewer boundary constraints.
+            avail = (x_hi - x_lo) * (y_hi - y_lo) - pre_area
+            if avail < place_area * 1.002:
+                n_right = sum(1 for i in range(block_count) if boundary_codes[i] & 2 and not fixed_xy[i])
+                n_top = sum(1 for i in range(block_count) if boundary_codes[i] & 4 and not fixed_xy[i])
+                need = place_area * 1.004 + pre_area
+                if n_top <= n_right:
+                    y_hi = y_lo + need / max(x_hi - x_lo, eps)
+                else:
+                    x_hi = x_lo + need / max(y_hi - y_lo, eps)
+            pre_top_max = max((r[1] + r[3] for r in pre_rects), default=None)
+            return x_lo, y_lo, x_hi, y_hi, pre_top_max
+
+        def frame_target_centers(frame):
+            # Connectivity-driven desired centers: damped Jacobi averaging of
+            # neighbour centres with pins and preplaced blocks as anchors.
+            x_lo, y_lo, x_hi, y_hi = frame[:4]
+            cx0 = (x_lo + x_hi) / 2.0
+            cy0 = (y_lo + y_hi) / 2.0
+            txs = [cx0] * block_count
+            tys = [cy0] * block_count
+            for i in range(block_count):
+                if fixed_xy[i]:
+                    px, py, pw, ph = preplaced_positions[i]
+                    txs[i] = px + pw / 2.0
+                    tys[i] = py + ph / 2.0
+                elif pin_centroid[i] is not None:
+                    txs[i], tys[i] = pin_centroid[i]
+            for _ in range(40):
+                new_tx = txs[:]
+                new_ty = tys[:]
+                for i in range(block_count):
+                    if fixed_xy[i]:
+                        continue
+                    sx = sy = sw = 0.0
+                    for nbr, weight in b2b_adj[i]:
+                        sx += weight * txs[nbr]
+                        sy += weight * tys[nbr]
+                        sw += weight
+                    if pin_centroid[i] is not None and p2b_degree[i] > 0:
+                        sx += p2b_degree[i] * pin_centroid[i][0]
+                        sy += p2b_degree[i] * pin_centroid[i][1]
+                        sw += p2b_degree[i]
+                    if sw > 0:
+                        new_tx[i] = 0.7 * (sx / sw) + 0.3 * txs[i]
+                        new_ty[i] = 0.7 * (sy / sw) + 0.3 * tys[i]
+                txs, tys = new_tx, new_ty
+            for i in range(block_count):
+                txs[i] = min(max(txs[i], x_lo), x_hi)
+                tys[i] = min(max(tys[i], y_lo), y_hi)
+            return txs, tys
+
+        def build_frame_rows(h_scale=1.0, target_override=None):
+            if block_count <= 0:
+                return None
+            frame = frame_anchor_frame()
+            x_lo, y_lo, x_hi, y_hi, pre_top_max = frame
+            width_total = x_hi - x_lo
+            height_total = y_hi - y_lo
+            if width_total <= eps or height_total <= eps:
+                return None
+            if target_override is not None:
+                txs, tys = target_override
+            else:
+                txs, tys = frame_target_centers(frame)
+
+            placeable = [i for i in range(block_count) if not fixed_xy[i]]
+            pre_rects = list(preplaced_positions.values())
+            pre_area = sum(r[2] * r[3] for r in pre_rects)
+            place_area = sum(areas[i] for i in placeable)
+            if not placeable:
+                return [tuple(preplaced_positions[i]) for i in range(block_count)] if len(preplaced_positions) == block_count else None
+            avail = width_total * height_total - pre_area
+            fill_factor = min(1.0, max(0.85, place_area / max(avail, eps)))
+
+            def free_intervals(y0, y1):
+                # Free x-spans of the frame not occluded by preplaced rects
+                # intersecting the horizontal band (y0, y1).
+                blocked = []
+                for rx, ry, rw, rh in pre_rects:
+                    if ry < y1 - 1e-9 and ry + rh > y0 + 1e-9:
+                        blocked.append((max(rx, x_lo), min(rx + rw, x_hi)))
+                blocked.sort()
+                intervals = []
+                cursor = x_lo
+                for bx0, bx1 in blocked:
+                    if bx1 <= cursor + 1e-9:
+                        continue
+                    if bx0 > cursor + 1e-9:
+                        intervals.append((cursor, bx0))
+                    cursor = max(cursor, bx1)
+                if x_hi > cursor + 1e-9:
+                    intervals.append((cursor, x_hi))
+                return [(a, b) for a, b in intervals if b - a > 1e-7]
+
+            # ---- units ---------------------------------------------------
+            # A unit is a horizontal run of cells placed together in a row.
+            # Cells: ('soft', block) spans the full row height with width
+            # area/h; ('fixed', block, w, h) keeps exact dims bottom-aligned.
+            areas_sorted_hint = sorted(areas[b] for b in placeable)
+            med_area_hint = areas_sorted_hint[len(areas_sorted_hint) // 2]
+            mib_groups = {}
+            for i in placeable:
+                if mib_ids[i] > 0:
+                    mib_groups.setdefault(mib_ids[i], []).append(i)
+            cluster_groups = {}
+            for i in placeable:
+                if cluster_ids[i] > 0:
+                    cluster_groups.setdefault(cluster_ids[i], []).append(i)
+
+            # MIB groups become fixed-dim cells when a member has hard dims
+            # or members are scattered into clusters; otherwise they form a
+            # same-row run of identical full-height cells.
+            mib_cell_dims = {}
+            mib_as_run = {}
+            for gid, members in mib_groups.items():
+                fixed_members = [b for b in members if fixed_dim[b]]
+                in_cluster = any(cluster_ids[b] > 0 for b in members)
+                if fixed_members:
+                    fw = float(tensor_value(target_positions, fixed_members[0], 2))
+                    fh = float(tensor_value(target_positions, fixed_members[0], 3))
+                    if fw > eps and fh > eps:
+                        for b in members:
+                            if fixed_dim[b] or abs(fw * fh - areas[b]) / max(areas[b], 1e-9) <= 0.009:
+                                mib_cell_dims[b] = (fw, fh)
+                elif in_cluster:
+                    side = math.sqrt(max(min(areas[b] for b in members), eps))
+                    for b in members:
+                        mib_cell_dims[b] = (side, areas[b] / side)
+                else:
+                    mib_as_run[gid] = members
+
+            def block_cell(b):
+                if b in mib_cell_dims:
+                    w, h = mib_cell_dims[b]
+                    return ("fixed", b, w, h)
+                if fixed_dim[b]:
+                    return ("fixed", b,
+                            float(tensor_value(target_positions, b, 2)),
+                            float(tensor_value(target_positions, b, 3)))
+                return ("soft", b)
+
+            units = []
+            in_unit = set()
+
+            def add_unit(members, kind):
+                members = [b for b in members if b not in in_unit]
+                if not members:
+                    return
+                in_unit.update(members)
+                code_l = any(boundary_codes[b] & 1 for b in members)
+                code_r = any(boundary_codes[b] & 2 for b in members)
+                code_t = any(boundary_codes[b] & 4 for b in members)
+                code_b = any(boundary_codes[b] & 8 for b in members)
+                units.append({
+                    "members": members,
+                    "kind": kind,
+                    "cells": [block_cell(b) for b in members],
+                    "area": sum(areas[b] for b in members),
+                    "L": code_l, "R": code_r, "T": code_t, "B": code_b,
+                    "tx": sum(txs[b] for b in members) / len(members),
+                    "ty": sum(tys[b] for b in members) / len(members),
+                })
+
+            for gid, members in sorted(cluster_groups.items()):
+                # Bottom/top-coded members split into their own chunk so the
+                # forced edge row only carries them; the remainder is given a
+                # ty just above/below the edge so the chunks land in adjacent
+                # rows and stay edge-connected.
+                b_members = [b for b in members if boundary_codes[b] & 8]
+                t_members = [b for b in members if boundary_codes[b] & 4 and not (boundary_codes[b] & 8)]
+                rest = [b for b in members if b not in b_members and b not in t_members]
+
+                def cluster_ordered(sub):
+                    lefts = [b for b in sub if boundary_codes[b] & 1]
+                    rights = [b for b in sub if boundary_codes[b] & 2 and not (boundary_codes[b] & 1)]
+                    interior = [b for b in sub if b not in lefts and b not in rights]
+                    return lefts + sorted(interior, key=lambda b: txs[b]) + rights
+
+                if b_members and rest and not t_members:
+                    add_unit(cluster_ordered(b_members), "cluster")
+                    add_unit(cluster_ordered(rest), "cluster")
+                    units[-1]["ty"] = y_lo + 1.3 * math.sqrt(max(med_area_hint, eps))
+                elif t_members and rest and not b_members:
+                    add_unit(cluster_ordered(t_members), "cluster")
+                    add_unit(cluster_ordered(rest), "cluster")
+                    units[-1]["ty"] = y_hi - 1.3 * math.sqrt(max(med_area_hint, eps))
+                else:
+                    add_unit(cluster_ordered(members), "cluster")
+            for gid, members in sorted(mib_as_run.items()):
+                lefts = [b for b in members if boundary_codes[b] & 1]
+                rights = [b for b in members if boundary_codes[b] & 2 and not (boundary_codes[b] & 1)]
+                interior = [b for b in members if b not in lefts and b not in rights]
+                add_unit(lefts + sorted(interior, key=lambda b: txs[b]) + rights, "mib")
+            for b in placeable:
+                if b not in in_unit:
+                    add_unit([b], "single")
+
+            # ---- row plan --------------------------------------------------
+            sorted_areas = sorted(areas[b] for b in placeable)
+            med_area = sorted_areas[len(sorted_areas) // 2]
+            h_target = max(math.sqrt(max(med_area, eps) * 1.35) * h_scale, height_total / 60.0)
+            est_rows = max(2, int(round(height_total / h_target)))
+
+            def edge_pending(flag):
+                return [u for u in units if u[flag] and not (u["B"] or u["T"])]
+
+            if (len(edge_pending("L")) > est_rows - 1
+                    or len(edge_pending("R")) > est_rows - 1):
+                # Pair small single left/right units into vertical stacks so
+                # one row start/end can host two edge blocks.
+                def pair_stacks(flag):
+                    while True:
+                        edge_now = edge_pending(flag)
+                        if len(edge_now) <= max(est_rows - 1, 1):
+                            break
+                        singles = [u for u in edge_now
+                                   if u["kind"] in ("single", "stack") and len(u["members"]) < 3]
+                        singles.sort(key=lambda u: (len(u["members"]), u["ty"]))
+                        if len(singles) < 2:
+                            break
+                        first, second = singles[0], singles[1]
+                        units.remove(first)
+                        units.remove(second)
+                        merged_members = first["members"] + second["members"]
+                        in_unit.difference_update(merged_members)
+                        add_unit(merged_members, "stack")
+                pair_stacks("L")
+                pair_stacks("R")
+
+            bottom_units = [u for u in units if u["B"] and not u["T"]]
+            top_units = [u for u in units if u["T"]]
+            left_queue = sorted(edge_pending("L"), key=lambda u: u["ty"])
+            right_queue = sorted([u for u in edge_pending("R") if not u["L"]], key=lambda u: u["ty"])
+            reserved_ids = {id(u) for u in bottom_units + top_units + left_queue + right_queue}
+            pool = sorted([u for u in units if id(u) not in reserved_ids], key=lambda u: u["ty"])
+
+            positions = [None] * block_count
+            for i, rect in preplaced_positions.items():
+                positions[i] = tuple(rect)
+
+            cuts = sorted({float(y_hi)} | {float(r[1]) for r in pre_rects} | {float(r[1] + r[3]) for r in pre_rects})
+
+            def patchable(u):
+                return (u["kind"] == "single"
+                        and not (u["L"] or u["R"] or u["B"] or u["T"])
+                        and len(u["cells"]) == 1 and u["cells"][0][0] == "soft")
+
+            def take_patch(target_area, max_area):
+                # Pull the best-fitting small soft single out of the pool to
+                # fill a pocket above a fixed-dimension cell.
+                best = None
+                best_diff = None
+                for u in pool:
+                    if not patchable(u) or u["area"] > max_area:
+                        continue
+                    diff = abs(u["area"] - target_area)
+                    if best_diff is None or diff < best_diff:
+                        best_diff = diff
+                        best = u
+                if best is not None and best["area"] >= 0.30 * target_area:
+                    pool.remove(best)
+                    return best
+                return None
+
+            def remaining_area():
+                return (sum(u["area"] for u in pool)
+                        + sum(u["area"] for u in left_queue)
+                        + sum(u["area"] for u in right_queue)
+                        + sum(u["area"] for u in top_units))
+
+            # ---- build rows bottom-up --------------------------------------
+            current_y = y_lo
+            row_no = 0
+            max_rows = 4 * est_rows + 12
+            pending_b = list(bottom_units)
+            failed_units = []
+
+            # Split oversized cluster runs into row-sized chunks; chunks keep
+            # similar ty so they land in consecutive rows and stay
+            # edge-connected through vertical adjacency.  Bottom/top-coded
+            # members are grouped into the first chunk so the forced row
+            # keeps them.
+            chunk_cap = 0.62 * width_total * h_target
+            for u in [u_ for u_ in units if u_["kind"] == "cluster" and u_["area"] > 1.20 * chunk_cap]:
+                members = sorted(u["members"], key=lambda b: (
+                    0 if boundary_codes[b] & 8 else (2 if boundary_codes[b] & 4 else 1), txs[b]))
+                chunks = []
+                cur = []
+                cur_area = 0.0
+                for b in members:
+                    cur.append(b)
+                    cur_area += areas[b]
+                    if cur_area >= 0.85 * chunk_cap:
+                        chunks.append(cur)
+                        cur = []
+                        cur_area = 0.0
+                if cur:
+                    if chunks and cur_area < 0.25 * chunk_cap:
+                        chunks[-1].extend(cur)
+                    else:
+                        chunks.append(cur)
+                if len(chunks) <= 1:
+                    continue
+                units.remove(u)
+                in_unit.difference_update(u["members"])
+                for chunk in chunks:
+                    add_unit(chunk, "cluster")
+            bottom_units = [u for u in units if u["B"] and not u["T"]]
+            top_units = [u for u in units if u["T"]]
+            left_queue = sorted(edge_pending("L"), key=lambda u: u["ty"])
+            right_queue = sorted([u for u in edge_pending("R") if not u["L"]], key=lambda u: u["ty"])
+            reserved_ids = {id(u) for u in bottom_units + top_units + left_queue + right_queue}
+            pool = sorted([u for u in units if id(u) not in reserved_ids], key=lambda u: u["ty"])
+            pending_b = list(bottom_units)
+
+            def unit_width(u, h_val):
+                width_sum = 0.0
+                for cell in u["cells"]:
+                    if cell[0] == "soft":
+                        width_sum += areas[cell[1]] / h_val
+                    else:
+                        width_sum += cell[2]
+                return width_sum
+
+            def pack_row(ordered, h_val, iv, row_y_val):
+                # Dry-run interval packing.  Returns rect assignments, the
+                # units that fit, leftover units, and pocket gaps above
+                # fixed cells.
+                rects = {}
+                pockets = []
+                fitted = []
+                leftover = []
+                iv_idx = 0
+                cursor = iv[0][0]
+                for u in ordered:
+                    uw = unit_width(u, h_val)
+                    while iv_idx < len(iv) and cursor + uw > iv[iv_idx][1] + 1e-9:
+                        iv_idx += 1
+                        if iv_idx < len(iv):
+                            cursor = iv[iv_idx][0]
+                    if iv_idx >= len(iv):
+                        leftover.append(u)
+                        iv_idx = len(iv) - 1
+                        cursor = iv[iv_idx][1]
+                        continue
+                    if (u["R"] and not u["L"] and u is ordered[-1]
+                            and abs(iv[-1][1] - x_hi) < 1e-9 and iv_idx == len(iv) - 1):
+                        cursor = max(x_hi - uw, cursor)
+                    x_run = cursor
+                    for cell in u["cells"]:
+                        if cell[0] == "soft":
+                            b = cell[1]
+                            cw = areas[b] / h_val
+                            rects[b] = (x_run, row_y_val, cw, h_val)
+                            x_run += cw
+                        else:
+                            b, fw, fh = cell[1], cell[2], cell[3]
+                            rects[b] = (x_run, row_y_val, fw, fh)
+                            if h_val - fh > 1e-7:
+                                pockets.append((x_run, row_y_val + fh, fw, h_val - fh))
+                            x_run += fw
+                    cursor = x_run
+                    fitted.append(u)
+                return rects, fitted, leftover, pockets
+
+            # Pre-pin bottom-coded units as bottom-anchored obstacles with
+            # natural heights; subsequent rows flow around them exactly like
+            # preplaced blocks.  This avoids forcing one uniform-height
+            # bottom row for all of them.
+            def overhead_limit(x0, x1):
+                lim = max(y_hi - y_lo, h_target)
+                for rx, ry, rw, rh in pre_rects:
+                    if rx < x1 - 1e-9 and rx + rw > x0 + 1e-9:
+                        lim = min(lim, ry - y_lo)
+                return lim
+
+            if pending_b:
+                corner_l = [u for u in pending_b if u["L"]]
+                corner_r = [u for u in pending_b if u["R"] and not u["L"]]
+                middle_b = [u for u in pending_b if not u["L"] and not u["R"]]
+                ordered_b = (corner_l + sorted(middle_b, key=lambda u: u["tx"]) + corner_r)
+                cursor = x_lo
+                unpinned = []
+                pinned_rects = []
+                pinned_blocks = {}
+                for u in ordered_b:
+                    u_soft = sum(areas[c[1]] for c in u["cells"] if c[0] == "soft")
+                    u_fixed_w = sum(c[2] for c in u["cells"] if c[0] == "fixed")
+                    u_fixed_h = max((c[3] for c in u["cells"] if c[0] == "fixed"), default=0.0)
+                    h_i = max(min(math.sqrt(max(u["area"], eps) * 1.2), 2.4 * h_target),
+                              0.8 * h_target, u_fixed_h, eps)
+                    placed_pin = False
+                    for _ in range(3):
+                        w_i = u_soft / max(h_i, eps) + u_fixed_w
+                        start = cursor
+                        if u["R"] and not u["L"]:
+                            start = max(x_hi - w_i, cursor)
+                        lim = overhead_limit(start, start + w_i)
+                        if max(u_fixed_h, 0.45 * h_target) > lim + 1e-9:
+                            # Too little headroom here; leave to the row engine.
+                            break
+                        if h_i <= lim + 1e-9:
+                            if start + w_i <= x_hi + 1e-9:
+                                # Commit the pin.
+                                x_run = start
+                                for cell in u["cells"]:
+                                    if cell[0] == "soft":
+                                        b = cell[1]
+                                        cw = areas[b] / h_i
+                                        pinned_blocks[b] = (x_run, y_lo, cw, h_i)
+                                        x_run += cw
+                                    else:
+                                        b, fw, fh = cell[1], cell[2], cell[3]
+                                        pinned_blocks[b] = (x_run, y_lo, fw, fh)
+                                        x_run += fw
+                                if u["kind"] == "stack":
+                                    xs = start
+                                    stack_w = sum(areas[b] for b in u["members"]) / h_i
+                                    yy = y_lo
+                                    for b in u["members"]:
+                                        bh = areas[b] / stack_w
+                                        pinned_blocks[b] = (xs, yy, stack_w, bh)
+                                        yy += bh
+                                pinned_rects.append((start, y_lo, x_run - start, h_i))
+                                cursor = x_run
+                                placed_pin = True
+                            break
+                        h_i = max(lim, u_fixed_h)
+                    if not placed_pin:
+                        unpinned.append(u)
+                if pinned_rects:
+                    for b, rect in pinned_blocks.items():
+                        positions[b] = rect
+                    pre_rects.extend(pinned_rects)
+                    pinned_area = sum(r[2] * r[3] for r in pinned_rects)
+                    pre_area += pinned_area
+                    place_area = max(place_area - sum(
+                        u["area"] for u in ordered_b if u not in unpinned), eps)
+                    avail = width_total * height_total - pre_area
+                    fill_factor = min(1.0, max(0.85, place_area / max(avail, eps)))
+                    cuts = sorted(set(cuts) | {float(r[1] + r[3]) for r in pinned_rects})
+                pending_b = unpinned
+
+            while (pending_b or pool or left_queue or right_queue or top_units) and row_no < max_rows:
+                row_no += 1
+                room_left = max(y_hi - current_y, 0.0)
+                rem = remaining_area() + sum(u["area"] for u in pending_b)
+                if os_mod.environ.get("FLOORSET_FRAME_DEBUG", "") == "2":
+                    print(f"      enter row {row_no}: y={current_y:.1f} pend_b={len(pending_b)} pool={len(pool)} "
+                          f"lq={len(left_queue)} rq={len(right_queue)} top={len(top_units)} rem={rem:.0f}")
+
+                # Rows live inside bands delimited by preplaced y-edges, so
+                # the free intervals are constant for the whole row and the
+                # height computation cannot feed back on itself.
+                next_cuts = [c for c in cuts if c > current_y + 0.30 * h_target]
+                band_top = next_cuts[0] if next_cuts else max(y_hi, current_y + h_target)
+                h_cap = band_top - current_y
+                iv = free_intervals(current_y, current_y + min(h_cap, h_target) * 0.999)
+                if not iv:
+                    current_y = band_top
+                    continue
+                length = sum(b - a for a, b in iv)
+                widest = max(b - a for a, b in iv)
+
+                is_bottom = bool(pending_b)
+                is_top = (not pending_b and (
+                    rem <= 1.9 * h_target * max(length, eps)
+                    or not (pool or left_queue or right_queue)))
+
+                content = []
+                if is_bottom:
+                    content.extend(pending_b)
+                    pending_b = []
+                if is_top:
+                    content.extend(top_units)
+                    top_units = []
+                    content.extend(left_queue)
+                    left_queue = []
+                    content.extend(right_queue)
+                    right_queue = []
+                    content.extend(pool)
+                    pool = []
+                else:
+                    # One left/right edge unit per row when the row actually
+                    # touches the corresponding frame edge.
+                    rows_left_est = max(room_left / max(h_target, eps), 1.0)
+                    if (left_queue and abs(iv[0][0] - x_lo) < 1e-7
+                            and not any(u["L"] for u in content)):
+                        mid_y = current_y + h_target / 2.0
+                        pick = min(left_queue, key=lambda u: abs(u["ty"] - mid_y))
+                        if (abs(pick["ty"] - mid_y) < 2.5 * h_target
+                                or len(left_queue) >= rows_left_est - 1):
+                            left_queue.remove(pick)
+                            content.append(pick)
+                    if (right_queue and abs(iv[-1][1] - x_hi) < 1e-7
+                            and not any(u["R"] for u in content)):
+                        mid_y = current_y + h_target / 2.0
+                        pick = min(right_queue, key=lambda u: abs(u["ty"] - mid_y))
+                        if (abs(pick["ty"] - mid_y) < 2.5 * h_target
+                                or len(right_queue) >= rows_left_est - 1):
+                            right_queue.remove(pick)
+                            content.append(pick)
+                    # Fill from the ty-sorted pool with a small lookahead.
+                    cap = max(length * h_target * 1.04,
+                              sum(u["area"] for u in content))
+                    load = sum(u["area"] for u in content)
+                    while pool and load < cap:
+                        picked = None
+                        for u in pool[:6]:
+                            if load + u["area"] > cap * 1.30:
+                                continue
+                            # Skip units that can never fit this band's
+                            # widest interval even at the band-cap height.
+                            if unit_width(u, max(h_cap, h_target)) > 0.95 * widest:
+                                continue
+                            picked = u
+                            break
+                        if picked is None:
+                            fitting = [u for u in pool[:6]
+                                       if unit_width(u, max(h_cap, h_target)) <= 0.95 * widest]
+                            if load < 0.55 * cap and fitting:
+                                picked = min(fitting, key=lambda u: u["area"])
+                            else:
+                                break
+                        pool.remove(picked)
+                        content.append(picked)
+                        load += picked["area"]
+
+                if not content:
+                    break
+
+                def content_sums(units_list):
+                    s_area = 0.0
+                    f_w = 0.0
+                    f_h = 0.0
+                    for u in units_list:
+                        for cell in u["cells"]:
+                            if cell[0] == "soft":
+                                s_area += areas[cell[1]]
+                            else:
+                                f_w += cell[2]
+                                f_h = max(f_h, cell[3])
+                    return s_area, f_w, f_h
+
+                def min_fit_height(units_list, widest_len):
+                    h_fit = 0.0
+                    for u in units_list:
+                        u_soft = sum(areas[c[1]] for c in u["cells"] if c[0] == "soft")
+                        u_fixed = sum(c[2] for c in u["cells"] if c[0] == "fixed")
+                        cap_w = 0.95 * widest_len - u_fixed
+                        if cap_w > eps and u_soft > 0:
+                            h_fit = max(h_fit, u_soft / cap_w)
+                    return h_fit
+
+                soft_area, fixed_w_sum, max_fixed_h = content_sums(content)
+                denom = length * fill_factor - fixed_w_sum
+                h_needed = soft_area / denom if denom > eps else h_cap
+                h_needed = max(h_needed, min_fit_height(content, widest), max_fixed_h)
+
+                row_y = current_y
+                grew_past_cap = False
+                if is_top:
+                    # Land the top row flush with the highest hard edge so
+                    # top-coded blocks touch the bounding box; float the row
+                    # upward when content ends below that edge.
+                    h_row = h_needed
+                    if pre_top_max is not None and any(u["T"] for u in content):
+                        row_y = max(current_y, pre_top_max - h_row)
+                        h_row = max(h_row, pre_top_max - row_y)
+                    if row_y + h_row > band_top + 1e-9:
+                        grew_past_cap = True
+                elif h_needed > h_cap + eps:
+                    if is_bottom:
+                        # Bottom rows must keep their content; cross the cut
+                        # conservatively.
+                        h_row = h_needed
+                        grew_past_cap = True
+                    else:
+                        # Cap at the band edge and shed the overflow: first
+                        # units too wide for the band's widest interval, then
+                        # by area until the height fits.
+                        h_row = h_cap
+                        for u in [u_ for u_ in content
+                                  if not (u_["L"] or u_["R"] or u_["B"] or u_["T"])]:
+                            if unit_width(u, h_cap) > 0.95 * widest:
+                                content.remove(u)
+                                pool.insert(0, u)
+                        droppable = sorted(
+                            [u for u in content
+                             if not (u["L"] or u["R"] or u["B"] or u["T"])],
+                            key=lambda u: u["area"], reverse=True)
+                        while droppable:
+                            s_a, f_w, f_h = content_sums(content)
+                            d = length * fill_factor - f_w
+                            need = s_a / d if d > eps else h_cap * 2
+                            if max(need, f_h) <= h_cap:
+                                break
+                            drop = droppable.pop(0)
+                            content.remove(drop)
+                            pool.insert(0, drop)
+                        soft_area, fixed_w_sum, max_fixed_h = content_sums(content)
+                        if max_fixed_h > h_cap:
+                            h_row = max_fixed_h
+                            grew_past_cap = True
+                elif h_needed > 0.72 * h_cap:
+                    # Close enough to the band edge: stretch and absorb the
+                    # slack horizontally so no sliver remains above the row.
+                    h_row = h_cap
+                else:
+                    h_row = h_needed
+
+                if grew_past_cap:
+                    # Recompute intervals conservatively over the true span
+                    # (single pass, no feedback loop).
+                    iv = free_intervals(row_y, row_y + h_row)
+                    length = sum(b - a for a, b in iv)
+                    if not iv or length <= eps:
+                        for u in content:
+                            if u["B"]:
+                                pending_b.append(u)
+                            elif u["T"]:
+                                top_units.append(u)
+                            else:
+                                pool.insert(0, u)
+                        current_y = band_top
+                        continue
+                    denom = length * fill_factor - fixed_w_sum
+                    if denom > eps:
+                        h_row = max(soft_area / denom,
+                                    min_fit_height(content, max(b - a for a, b in iv)),
+                                    max_fixed_h, h_row)
+
+                # Top up stretched rows so the taller row stays filled.
+                if not is_top:
+                    deficit = (length * fill_factor - fixed_w_sum) * h_row - soft_area
+                    guard = 0
+                    while deficit > 0.6 * med_area and pool and guard < 12:
+                        guard += 1
+                        picked = None
+                        for u in pool[:10]:
+                            if u["area"] <= deficit * 1.06 and not (u["L"] or u["R"]):
+                                if any(c[0] == "fixed" and c[3] > h_row - 1e-7 for c in u["cells"]):
+                                    continue
+                                if picked is None or u["area"] > picked["area"]:
+                                    picked = u
+                        if picked is None:
+                            break
+                        pool.remove(picked)
+                        content.append(picked)
+                        deficit -= picked["area"]
+                        soft_area += sum(areas[c[1]] for c in picked["cells"] if c[0] == "soft")
+                        fixed_w_sum += sum(c[2] for c in picked["cells"] if c[0] == "fixed")
+
+                total_w = sum(unit_width(u, h_row) for u in content)
+
+                # Pop uncoded units (smallest first) back into the pool until
+                # the content fits the available length.
+                if total_w > length - 1e-9:
+                    droppable = sorted(
+                        [u for u in content
+                         if not (u["L"] or u["R"] or u["B"] or u["T"])],
+                        key=lambda u: u["area"])
+                    while total_w > length - 1e-9 and droppable and not is_top:
+                        drop = droppable.pop(0)
+                        content.remove(drop)
+                        total_w -= unit_width(drop, h_row)
+                        pool.insert(0, drop)
+                    if total_w > length - 1e-9:
+                        # Grow height instead (last resort / top row).
+                        denom = length * 0.999 - fixed_w_sum
+                        if denom > eps:
+                            soft_now = sum(areas[c[1]] for u in content for c in u["cells"] if c[0] == "soft")
+                            new_h = max(h_row, soft_now / denom, max_fixed_h)
+                            if new_h > h_row + eps:
+                                h_row = new_h
+                                iv = free_intervals(row_y, row_y + h_row)
+                                length = sum(b - a for a, b in iv)
+                                total_w = sum(unit_width(u, h_row) for u in content)
+
+                # Order: left units first, right unit last, middle by tx.
+                left_first = [u for u in content if u["L"]]
+                right_last = [u for u in content if u["R"] and not u["L"]]
+                middle = [u for u in content if not u["L"] and not u["R"]]
+                middle.sort(key=lambda u: u["tx"])
+                ordered = left_first + middle + right_last
+
+                # Final interval refresh so packing always matches the true
+                # row span (h_row may have grown above).
+                iv = free_intervals(row_y, row_y + h_row)
+                length = sum(b - a for a, b in iv)
+                if not iv or length <= eps:
+                    for u in content:
+                        if u["B"]:
+                            pending_b.append(u)
+                        elif u["T"]:
+                            top_units.append(u)
+                        else:
+                            pool.insert(0, u)
+                    current_y = band_top
+                    continue
+
+                rects, fitted, leftover, pockets = pack_row(ordered, h_row, iv, row_y)
+                if leftover:
+                    # Fragmented row: retry widest-first, keep the better fit.
+                    ordered_ffd = (left_first
+                                   + sorted(middle, key=lambda u: unit_width(u, h_row), reverse=True)
+                                   + right_last)
+                    rects2, fitted2, leftover2, pockets2 = pack_row(ordered_ffd, h_row, iv, row_y)
+                    if sum(u["area"] for u in leftover2) < sum(u["area"] for u in leftover):
+                        rects, fitted, leftover, pockets = rects2, fitted2, leftover2, pockets2
+                if leftover and fitted and not is_top:
+                    # The row was sized for content that leaked out; shrink it
+                    # to the fitted content and re-pack so no dead band stays.
+                    s_f, f_w_f, f_h_f = content_sums(fitted)
+                    iv_short = free_intervals(row_y, row_y + max(f_h_f, eps, h_target * 0.4))
+                    len_short = sum(b - a for a, b in iv_short)
+                    d2 = len_short * fill_factor - f_w_f
+                    if d2 > eps:
+                        h2 = max(s_f / d2, f_h_f, h_target * 0.4)
+                        if h2 < h_row - 1e-6:
+                            iv2 = free_intervals(row_y, row_y + h2)
+                            len2 = sum(b - a for a, b in iv2)
+                            if iv2 and len2 > eps:
+                                ordered2 = [u for u in ordered if u in fitted]
+                                rects3, fitted3, leftover3, pockets3 = pack_row(ordered2, h2, iv2, row_y)
+                                if not leftover3:
+                                    rects, fitted, pockets = rects3, fitted3, pockets3
+                                    h_row = h2
+                                    iv = iv2
+                                    length = len2
+                if os_mod.environ.get("FLOORSET_FRAME_DEBUG", "") == "2" and leftover:
+                    print(f"        pack: h={h_row:.2f} iv={[(round(a,1),round(b,1)) for a,b in iv]} "
+                          f"fit={len(fitted)} left={[(u['kind'], round(u['area']), round(unit_width(u, h_row),1)) for u in leftover]}")
+
+                if not fitted:
+                    # Nothing fits this row; recycle and advance to the next
+                    # band edge so the loop keeps making progress.
+                    for u in leftover:
+                        if u["B"]:
+                            pending_b.append(u)
+                        elif u["T"]:
+                            top_units.append(u)
+                        else:
+                            pool.insert(0, u)
+                    current_y = band_top
+                    continue
+
+                # Commit.
+                for b, rect in rects.items():
+                    positions[b] = rect
+                for u in leftover:
+                    if is_top:
+                        failed_units.append(u)
+                    elif u["B"]:
+                        pending_b.append(u)
+                    elif u["T"]:
+                        top_units.append(u)
+                    else:
+                        pool.insert(0, u)
+
+                # Stack units: re-place members vertically inside the unit's
+                # footprint so each touches the row's start edge.
+                for u in fitted:
+                    if u["kind"] != "stack":
+                        continue
+                    xs = min(positions[b][0] for b in u["members"])
+                    stack_w = sum(areas[b] for b in u["members"]) / h_row
+                    yy = row_y
+                    for b in u["members"]:
+                        bh = areas[b] / stack_w
+                        positions[b] = (xs, yy, stack_w, bh)
+                        yy += bh
+
+                # Fill pockets above fixed cells with best-fitting soft
+                # singles pulled from the pool.
+                for px, py, pw_, ph_ in pockets:
+                    rem_h = ph_
+                    guard = 0
+                    while rem_h * pw_ > 0.25 * med_area and guard < 3:
+                        guard += 1
+                        patch = take_patch(rem_h * pw_, rem_h * pw_ * (1.0 - 1e-9))
+                        if patch is None:
+                            break
+                        b = patch["members"][0]
+                        bh = areas[b] / pw_
+                        positions[b] = (px, py + (ph_ - rem_h), pw_, bh)
+                        rem_h -= bh
+
+                if os_mod.environ.get("FLOORSET_FRAME_DEBUG", "") == "2":
+                    ws_row = length * h_row - sum(u["area"] for u in fitted)
+                    print(f"      row {row_no}: y={row_y:.1f} h={h_row:.1f} len={length:.1f} "
+                          f"units={len(content)} placed={len(fitted)} totw={total_w:.1f} "
+                          f"ws={ws_row:.0f} top={is_top} bot={is_bottom} maxfh={max_fixed_h:.1f}")
+                current_y = row_y + h_row
+
+            # Anything that never fit: simple shelf above everything.
+            leftover_units = []
+            seen_left = set()
+            for u in failed_units + pending_b + top_units + left_queue + right_queue + pool:
+                if id(u) in seen_left:
+                    continue
+                seen_left.add(id(u))
+                if any(positions[b] is None for b in u["members"]):
+                    leftover_units.append(u)
+            if leftover_units:
+                shelf_y = max(current_y, y_hi)
+                cursor = x_lo
+                shelf_h = max(h_target, max(
+                    (cell[3] for u in leftover_units for cell in u["cells"] if cell[0] == "fixed"),
+                    default=h_target))
+                row_max_h = shelf_h
+                for u in leftover_units:
+                    # Oversized units get a taller cell so they stay inside
+                    # the frame width.
+                    h_u = max(shelf_h, u["area"] / max(0.95 * (x_hi - x_lo), eps))
+                    uw = unit_width(u, h_u)
+                    if cursor > x_lo and cursor + uw > x_hi + 1e-9:
+                        # Wrap to a new shelf row instead of growing sideways.
+                        cursor = x_lo
+                        shelf_y += row_max_h
+                        row_max_h = shelf_h
+                    row_max_h = max(row_max_h, h_u)
+                    for cell in u["cells"]:
+                        if cell[0] == "soft":
+                            b = cell[1]
+                            if positions[b] is None:
+                                cw = areas[b] / h_u
+                                positions[b] = (cursor, shelf_y, cw, h_u)
+                                cursor += cw
+                        else:
+                            b, fw, fh = cell[1], cell[2], cell[3]
+                            if positions[b] is None:
+                                positions[b] = (cursor, shelf_y, fw, fh)
+                                cursor += fw
+            if any(p is None for p in positions):
+                return None
+            return positions
+
         best_positions = None
         best_cost = float("inf")
         flow_scores = {}
@@ -1639,6 +2675,44 @@ class MyOptimizer(FloorplanOptimizer):
             consider("trained_prior_order", legalize(make_draft(order_prior, prior_ratio_map), order_prior, ratio_map=prior_ratio_map, try_ratios=False, candidate_limit=(18 if block_count > 80 else 30)))
         if prior_loaded and prior_kind != "soft" and flow_enabled("trained_prior_cluster"):
             consider("trained_prior_cluster", legalize(make_draft(order_cluster, prior_ratio_map), order_cluster, ratio_map=prior_ratio_map, try_ratios=False, candidate_limit=(16 if block_count > 80 else 28)))
+
+        if flow_enabled("fd_init"):
+            base_draft = make_draft(order_importance)
+            fd_draft = force_directed_draft(base_draft)
+            consider("fd_init", legalize(fd_draft, order_importance, try_ratios=True, candidate_limit=(18 if block_count > 80 else 30)))
+        if flow_enabled("fd_cluster"):
+            base_draft = make_draft(order_cluster, prior_ratio_map if prior_loaded else None)
+            fd_draft = force_directed_draft(base_draft)
+            consider("fd_cluster", legalize(fd_draft, order_cluster, ratio_map=prior_ratio_map if prior_loaded else None, try_ratios=True, candidate_limit=(16 if block_count > 80 else 28)))
+
+        if flow_enabled("frame_rows"):
+            frame_debug = os_mod.environ.get("FLOORSET_FRAME_DEBUG", "") == "1"
+            for fr_scale in (1.0, 1.4, 0.75):
+                try:
+                    fr_positions = build_frame_rows(fr_scale)
+                except Exception:
+                    if frame_debug:
+                        import traceback
+                        traceback.print_exc()
+                    fr_positions = None
+                if fr_positions is not None:
+                    if frame_debug:
+                        summary = soft_violation_summary(fr_positions)
+                        bb = bbox_bounds(fr_positions)
+                        print(f"    [frame s={fr_scale}] feas={hard_feasible(fr_positions)} "
+                              f"cost={full_cost(fr_positions):.1f} bbox=({bb[0]:.1f},{bb[1]:.1f},{bb[2]:.1f},{bb[3]:.1f}) "
+                              f"area={(bb[2]-bb[0])*(bb[3]-bb[1]):.0f}/{total_area:.0f} "
+                              f"bnd={summary['boundary']} grp={summary['grouping']} mib={summary['mib']}")
+                        for i_ in range(block_count):
+                            for j_ in range(i_ + 1, block_count):
+                                if rectangles_overlap(fr_positions[i_], fr_positions[j_]):
+                                    print(f"      OVERLAP {i_}{'P' if fixed_xy[i_] else ''} {fr_positions[i_]} "
+                                          f"vs {j_}{'P' if fixed_xy[j_] else ''} {fr_positions[j_]}")
+                        for vb in summary["boundary_blocks"]:
+                            x, y, w, h = fr_positions[vb]
+                            print(f"      bndV blk={vb} code={boundary_codes[vb]} rect=({x:.1f},{y:.1f},{w:.1f},{h:.1f}) "
+                                  f"fixdim={fixed_dim[vb]} prepl={fixed_xy[vb]} clust={cluster_ids[vb]} mib={mib_ids[vb]}")
+                    consider(f"frame_rows_s{fr_scale}", fr_positions)
 
         def flatten_genome(cluster_seq, inner_orders):
             order = []
@@ -2436,6 +3510,80 @@ class MyOptimizer(FloorplanOptimizer):
             run_soft_final_repair(best_positions, "soft_final_repair_post")
             run_selective_ga_rescue()
 
+        # ------------------------------------------------------------------
+        # Contest-cost re-ranking.  full_cost weighs wirelength, bbox area
+        # and violations additively, which can prefer a low-wire sprawling
+        # layout over a compact one even though the real score multiplies
+        # relative gaps by exp(2·V_rel).  Re-rank the remembered candidates
+        # with a proxy of the actual formula and continue with that winner;
+        # the final refinement chain below is gated on the same proxy.
+        # ------------------------------------------------------------------
+        def candidate_wire(positions):
+            wire = 0.0
+            for i, j, weight in valid_b2b:
+                xi, yi, wi, hi = positions[i]
+                xj, yj, wj, hj = positions[j]
+                wire += weight * (abs((xi + wi / 2.0) - (xj + wj / 2.0)) +
+                                  abs((yi + hi / 2.0) - (yj + hj / 2.0)))
+            for pin, block, weight in valid_p2b:
+                x, y, w, h = positions[block]
+                px = tensor_value(pins_pos, pin, 0)
+                py = tensor_value(pins_pos, pin, 1)
+                wire += weight * (abs((x + w / 2.0) - px) + abs((y + h / 2.0) - py))
+            return wire
+
+        proxy_pool = [item["positions"] for item in candidate_pool]
+        if best_positions is not None:
+            proxy_pool.append([tuple(p) for p in best_positions])
+
+        feasible_pool = [p for p in proxy_pool if hard_feasible(p)]
+        wire_base = None
+        area_base = total_area * 1.035
+        for p in feasible_pool:
+            w = candidate_wire(p)
+            if wire_base is None or w < wire_base:
+                wire_base = w
+        if wire_base is None or wire_base <= eps:
+            wire_base = 1.0
+
+        def contest_proxy(positions):
+            if positions is None or len(positions) != block_count:
+                return float("inf")
+            wire = candidate_wire(positions)
+            area = bbox_area(positions)
+            summary = soft_violation_summary(positions)
+            quality = 1.0 + 0.5 * (max(0.0, wire / wire_base - 1.0)
+                                   + max(0.0, area / area_base - 1.0))
+            return quality * math.exp(2.0 * summary["relative"])
+
+        if feasible_pool:
+            ranked = sorted(feasible_pool, key=contest_proxy)
+            best_positions = [tuple(p) for p in ranked[0]]
+            best_cost = contest_proxy(best_positions)
+        elif best_positions is not None:
+            best_cost = contest_proxy(best_positions)
+
+        full_cost = contest_proxy
+
+        # Rebuild the frame tiling seeded with the proxy-best layout's block
+        # centres: projects the winning geometry onto the exact-area row
+        # structure (zero-whitespace form of the same arrangement).
+        if best_positions is not None and flow_enabled("frame_rows"):
+            seed_tx = [best_positions[i][0] + best_positions[i][2] / 2.0 for i in range(block_count)]
+            seed_ty = [best_positions[i][1] + best_positions[i][3] / 2.0 for i in range(block_count)]
+            for fr_scale in (1.0, 1.3):
+                try:
+                    fr_seeded = build_frame_rows(fr_scale, target_override=(seed_tx, seed_ty))
+                except Exception:
+                    fr_seeded = None
+                if fr_seeded is not None and hard_feasible(fr_seeded):
+                    fr_seeded = normalize_if_safe(fr_seeded)
+                    seeded_cost = contest_proxy(fr_seeded)
+                    if seeded_cost + 1e-9 < best_cost:
+                        best_positions = fr_seeded
+                        best_cost = seeded_cost
+                        flow_scores[f"frame_seeded_s{fr_scale}"] = seeded_cost
+
         def boundary_snap_pass(positions, max_iters=4):
             # Translate unsatisfied boundary blocks onto their required bbox
             # edge, keeping width/height unchanged. Accept only translations
@@ -2703,6 +3851,205 @@ class MyOptimizer(FloorplanOptimizer):
                     break
             return current
 
+        def top_backfill_pass(positions):
+            # Re-home free blocks that sit above the highest hard top edge
+            # (preplaced anchor) into row-end gaps below it.  Shrinks the
+            # bbox toward the anchored top so top-coded preplaced blocks can
+            # touch the bounding box again.
+            if positions is None or len(positions) != block_count:
+                return positions
+            tops = [r[1] + r[3] for r in preplaced_positions.values()]
+            if not tops:
+                return positions
+            y_anchor = max(tops)
+            current = [tuple(p) for p in positions]
+            bb = bbox_bounds(current)
+            if bb[3] <= y_anchor + 1e-7:
+                return positions
+
+            rows = {}
+            for i in range(block_count):
+                if fixed_xy[i]:
+                    continue
+                x, y, w, h = current[i]
+                if y + h <= y_anchor + 1e-7:
+                    rows.setdefault((round(y, 5), round(h, 5)), []).append(i)
+
+            def row_gaps(key, members):
+                y, h = key
+                occ = sorted((current[i][0], current[i][0] + current[i][2]) for i in members)
+                for rx, ry, rw, rh in preplaced_positions.values():
+                    if ry < y + h - 1e-9 and ry + rh > y + 1e-9:
+                        occ.append((rx, rx + rw))
+                occ.sort()
+                gaps = []
+                cursor = bb[0]
+                for a, b in occ:
+                    if a > cursor + 1e-7:
+                        gaps.append([cursor, a])
+                    cursor = max(cursor, b)
+                if bb[2] > cursor + 1e-7:
+                    gaps.append([cursor, bb[2]])
+                return gaps
+
+            gap_map = {key: row_gaps(key, members) for key, members in rows.items()}
+            movers = [i for i in range(block_count)
+                      if not fixed_xy[i] and not fixed_dim[i]
+                      and boundary_codes[i] == 0 and cluster_ids[i] == 0
+                      and mib_ids[i] == 0
+                      and current[i][1] >= y_anchor - 1e-7]
+            movers.sort(key=lambda i: areas[i])
+            for b in movers:
+                placed_flag = False
+                for key in sorted(gap_map, key=lambda k: -k[1]):
+                    y, h = key
+                    if h <= eps:
+                        continue
+                    w_need = areas[b] / h
+                    for gap in gap_map[key]:
+                        if gap[1] - gap[0] >= w_need + 1e-9:
+                            current[b] = (gap[0], y, w_need, h)
+                            gap[0] += w_need
+                            placed_flag = True
+                            break
+                    if placed_flag:
+                        break
+            return current
+
+        def row_swap_refine(positions, passes=3):
+            # Adjacent-pair swaps inside detected rows: blocks sharing the
+            # same (y, h) and abutting in x can swap order without touching
+            # feasibility (areas, dims, overlaps all preserved).  Greedy
+            # accept when the HPWL x-term improves.  Boundary-coded blocks
+            # stay put; cluster members only swap within their own cluster.
+            if positions is None or len(positions) != block_count:
+                return positions
+            current = [tuple(p) for p in positions]
+
+            def hpwl_x_for(block, cx_map):
+                total = 0.0
+                for nbr, weight in b2b_adj[block]:
+                    total += weight * abs(cx_map[block] - cx_map[nbr])
+                for pin, weight in p2b_adj[block]:
+                    px = tensor_value(pins_pos, pin, 0)
+                    total += weight * abs(cx_map[block] - px)
+                return total
+
+            for _ in range(passes):
+                rows = {}
+                for i in range(block_count):
+                    if fixed_xy[i]:
+                        continue
+                    x, y, w, h = current[i]
+                    rows.setdefault((round(y, 5), round(h, 5)), []).append(i)
+                improved = False
+                cx = {i: current[i][0] + current[i][2] / 2.0 for i in range(block_count)}
+                for key, members in rows.items():
+                    if len(members) < 2:
+                        continue
+                    members.sort(key=lambda i: current[i][0])
+                    for a_idx in range(len(members) - 1):
+                        i = members[a_idx]
+                        j = members[a_idx + 1]
+                        xi, yi, wi, hi = current[i]
+                        xj, yj, wj, hj = current[j]
+                        if abs(xi + wi - xj) > 1e-6:
+                            continue
+                        if boundary_codes[i] or boundary_codes[j]:
+                            continue
+                        if cluster_ids[i] != 0 or cluster_ids[j] != 0:
+                            # Same-cluster swaps shift member x-intervals and
+                            # can break marginal cross-row adjacency that the
+                            # evaluator's polygon union does not tolerate.
+                            continue
+                        if fixed_dim[i] or fixed_dim[j]:
+                            continue
+                        before = hpwl_x_for(i, cx) + hpwl_x_for(j, cx)
+                        # Edge (i, j) counted twice above; consistent after.
+                        old_ci, old_cj = cx[i], cx[j]
+                        cx[i] = xi + wj + wi / 2.0
+                        cx[j] = xi + wj / 2.0
+                        after = hpwl_x_for(i, cx) + hpwl_x_for(j, cx)
+                        if after + 1e-9 < before:
+                            current[i] = (xi + wj, yi, wi, hi)
+                            current[j] = (xi, yj, wj, hj)
+                            members[a_idx] = j
+                            members[a_idx + 1] = i
+                            improved = True
+                        else:
+                            cx[i], cx[j] = old_ci, old_cj
+                if not improved:
+                    break
+            return current
+
+        def row_boundary_reorder(positions):
+            # Move boundary-violating left/right-coded blocks to the start or
+            # end of their own row by shifting the blocks between — widths
+            # and heights unchanged, so feasibility is preserved exactly.
+            if positions is None or len(positions) != block_count:
+                return positions
+            current = [tuple(p) for p in positions]
+            bounds = bbox_bounds(current)
+            min_x, _, max_x, _ = bounds
+
+            rows = {}
+            for i in range(block_count):
+                if fixed_xy[i]:
+                    continue
+                x, y, w, h = current[i]
+                rows.setdefault((round(y, 5), round(h, 5)), []).append(i)
+
+            for key, members in rows.items():
+                members.sort(key=lambda i: current[i][0])
+                if any(cluster_ids[j] for j in members):
+                    # Shifting cluster members sideways risks breaking their
+                    # cross-row adjacency; leave such rows alone.
+                    continue
+                # Row must be contiguous from its first block for the shift
+                # arithmetic to stay exact.
+                for i in members:
+                    code = boundary_codes[i]
+                    if not code or touches_edge(current[i], bounds, code):
+                        continue
+                    idx = members.index(i)
+                    if (code & 1) and abs(current[members[0]][0] - min_x) < 1e-7:
+                        if any(boundary_codes[j] & 1 for j in members[:idx]):
+                            continue
+                        # Verify blocks first..idx-1 are contiguous with i.
+                        run_ok = all(
+                            abs(current[members[k]][0] + current[members[k]][2]
+                                - current[members[k + 1]][0]) < 1e-6
+                            for k in range(idx))
+                        if not run_ok:
+                            continue
+                        xi, yi, wi, hi = current[i]
+                        shift = wi
+                        new_x = min_x
+                        for j in members[:idx]:
+                            xj, yj, wj, hj = current[j]
+                            current[j] = (xj + shift, yj, wj, hj)
+                        current[i] = (new_x, yi, wi, hi)
+                        members[:idx + 1] = [i] + members[:idx]
+                    elif (code & 2):
+                        tail = members[idx + 1:]
+                        run_ok = all(
+                            abs(current[members[k]][0] + current[members[k]][2]
+                                - current[members[k + 1]][0]) < 1e-6
+                            for k in range(idx, len(members) - 1))
+                        if any(boundary_codes[j] & 2 for j in tail):
+                            continue
+                        if not run_ok:
+                            continue
+                        xi, yi, wi, hi = current[i]
+                        if max_x - wi < xi - 1e-9:
+                            continue
+                        for j in tail:
+                            xj, yj, wj, hj = current[j]
+                            current[j] = (xj - wi, yj, wj, hj)
+                        current[i] = (max_x - wi, yi, wi, hi)
+                        members[idx:] = tail + [i]
+            return current
+
         if best_positions is not None:
             compacted = compact_pass(best_positions)
             if hard_feasible(compacted):
@@ -2756,6 +4103,53 @@ class MyOptimizer(FloorplanOptimizer):
                     best_positions = final_compact
                     best_cost = fc_cost
                     flow_scores["compact_final"] = fc_cost
+
+            # Pull stragglers from above the anchored top edge into row-end
+            # gaps below; the smaller bbox restores top anchors and area.
+            backfilled = top_backfill_pass(best_positions)
+            if hard_feasible(backfilled):
+                bf_cost = full_cost(backfilled)
+                sv_new = soft_violation_summary(backfilled)
+                sv_old = soft_violation_summary(best_positions)
+                if (bf_cost + 1e-9 < best_cost
+                        and sv_new["grouping"] <= sv_old["grouping"]
+                        and sv_new["mib"] <= sv_old["mib"]):
+                    best_positions = backfilled
+                    best_cost = bf_cost
+                    flow_scores["top_backfill"] = bf_cost
+
+            # Row-aware boundary repair: slide violating left/right-coded
+            # blocks to their row's edge slot (exact, width-preserving).
+            # Horizontal shifts can break vertical cluster adjacency, so
+            # require the total soft-violation count not to increase.
+            reordered = row_boundary_reorder(best_positions)
+            if hard_feasible(reordered):
+                ro_cost = full_cost(reordered)
+                sv_new = soft_violation_summary(reordered)
+                sv_old = soft_violation_summary(best_positions)
+                if (ro_cost + 1e-9 < best_cost
+                        and sv_new["grouping"] <= sv_old["grouping"]
+                        and sv_new["boundary"] <= sv_old["boundary"]
+                        and sv_new["mib"] <= sv_old["mib"]):
+                    best_positions = reordered
+                    best_cost = ro_cost
+                    flow_scores["row_reorder"] = ro_cost
+
+            # Within-row adjacent swaps: exact HPWL refinement for row-
+            # structured layouts (no-op when rows don't abut).
+            if os_mod.environ.get("FLOORSET_NO_ROWSWAP", "") != "1":
+                row_swapped = row_swap_refine(best_positions)
+                if hard_feasible(row_swapped):
+                    rs_cost = full_cost(row_swapped)
+                    sv_new = soft_violation_summary(row_swapped)
+                    sv_old = soft_violation_summary(best_positions)
+                    if (rs_cost + 1e-9 < best_cost
+                            and sv_new["grouping"] <= sv_old["grouping"]
+                            and sv_new["boundary"] <= sv_old["boundary"]
+                            and sv_new["mib"] <= sv_old["mib"]):
+                        best_positions = row_swapped
+                        best_cost = rs_cost
+                        flow_scores["row_swap"] = rs_cost
 
         result = normalize_if_safe(best_positions)
         if not hard_feasible(result):
